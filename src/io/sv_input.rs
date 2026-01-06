@@ -86,6 +86,11 @@ impl SvSampleBuffer {
     }
 
     /// Add a sample to the buffer
+    /// 
+    /// This buffer uses a circular/ring buffer approach:
+    /// - Initially fills up to capacity by pushing samples
+    /// - Once full, overwrites oldest samples in a circular manner
+    /// - Samples are stored in insertion order, not sorted by time
     pub fn add_sample(&mut self, sample: i32) {
         if self.samples.len() < self.capacity {
             self.samples.push(sample);

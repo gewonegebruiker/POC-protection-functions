@@ -39,6 +39,7 @@ pub struct RmsCalculator {
     samples: Vec<f64>,
     window_size: usize,
     current_index: usize,
+    sample_count: usize,
 }
 
 impl RmsCalculator {
@@ -51,6 +52,7 @@ impl RmsCalculator {
             samples: vec![0.0; window_size],
             window_size,
             current_index: 0,
+            sample_count: 0,
         }
     }
 
@@ -61,6 +63,7 @@ impl RmsCalculator {
     pub fn add_sample(&mut self, sample: f64) {
         self.samples[self.current_index] = sample;
         self.current_index = (self.current_index + 1) % self.window_size;
+        self.sample_count += 1;
     }
 
     /// Calculate the current RMS value from accumulated samples
@@ -70,7 +73,7 @@ impl RmsCalculator {
 
     /// Check if the calculator has received a full window of samples
     pub fn is_full(&self) -> bool {
-        self.current_index == 0 && self.samples.iter().any(|&x| x != 0.0)
+        self.sample_count >= self.window_size
     }
 
     /// Get the number of samples in the window
@@ -82,6 +85,7 @@ impl RmsCalculator {
     pub fn reset(&mut self) {
         self.samples.fill(0.0);
         self.current_index = 0;
+        self.sample_count = 0;
     }
 }
 
