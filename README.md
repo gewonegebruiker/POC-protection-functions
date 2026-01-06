@@ -45,6 +45,7 @@ This project implements protection functions according to the IEC 61850 standard
 
 - Rust 1.70 or later
 - Linux operating system (for raw socket support)
+- **CAP_NET_RAW capability or root privileges** (required for live SV/GOOSE network I/O)
 
 ### Build
 
@@ -60,6 +61,8 @@ cargo run --release
 
 This runs a simulation that demonstrates the PTOC function with overcurrent detection.
 
+**Note**: The example runs in simulation mode. For live network operation with actual SV/GOOSE packets, you need root privileges or CAP_NET_RAW capability.
+
 ### Run Test Example
 
 ```bash
@@ -73,6 +76,87 @@ This runs a simple test showing PTOC behavior with different current levels.
 ```bash
 cargo test
 ```
+
+## Live Network I/O
+
+The implementation now includes **full IEC 61850 network integration** using `iec_61850_lib` with raw socket support:
+
+### SV Subscriber (Receiving Sampled Values)
+
+```rust
+use poc_protection_functions::{SvSubscriber, SvConfig};
+
+let config = SvConfig {
+    samples_per_cycle: 80,
+    interface: "eth0".to_string(),
+    multicast_mac: "01:0C:CD:04:00:00".to_string(),
+};
+
+let mut subscriber = SvSubscriber::new(config);
+subscriber.init()?;  // Requires CAP_NET_RAW
+
+// Receive samples (non-blocking)
+match subscriber.receive_sample() {
+    Ok(sample) => {
+        println!("Current ADC: {}", sample.current_adc);
+        // Process sample...
+    }
+    Err(e) => println!("No data: {}", e),
+}
+```
+
+### GOOSE Publisher (Sending Trip Signals)
+
+```rust
+use poc_protection_functions::{GoosePublisher, GooseConfig};
+
+let config = GooseConfig {
+    dst_mac: "01:0C:CD:01:00:00".to_string(),
+    appid: 0x0001,
+    goid: "PTOC_TRIP".to_string(),
+    gocb_ref: "IED1LD0/LLN0$GO$PTOC1".to_string(),
+    dat_set: "IED1LD0/LLN0$PTOC1".to_string(),
+    interface: "eth0".to_string(),
+};
+
+let mut publisher = GoosePublisher::new(config);
+publisher.init()?;  // Requires CAP_NET_RAW
+
+// Send trip message
+let timestamp = get_timestamp_micros();
+publisher.publish_trip(true, timestamp)?;  // Sends actual GOOSE frame
+```
+
+### Privileges Required
+
+Raw socket operations require elevated privileges:
+
+**Option 1: Run as root**
+```bash
+sudo cargo run --release
+```
+
+**Option 2: Grant CAP_NET_RAW capability**
+```bash
+# Build first
+cargo build --release
+
+# Grant capability to binary
+sudo setcap cap_net_raw+ep target/release/poc_ptoc
+
+# Now can run without sudo
+./target/release/poc_ptoc
+```
+
+### Network Setup
+
+For live operation:
+1. Connect IED/test equipment to same Ethernet network
+2. Configure correct network interface (`eth0`, `enp0s3`, etc.)
+3. Set multicast MAC addresses to match your equipment:
+   - SV typically uses `01:0C:CD:04:XX:XX`
+   - GOOSE typically uses `01:0C:CD:01:XX:XX`
+4. Ensure no firewall blocks raw Ethernet frames
 
 ## Configuration
 

@@ -13,6 +13,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 log = "0.4"
 env_logger = "0.11"
+socket2 = { version = "0.5", features = ["all"] }
+libc = "0.2"
 
 [lib]
 name = "poc_protection_functions"

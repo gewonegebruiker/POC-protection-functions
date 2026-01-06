@@ -1,6 +1,10 @@
 /// Sampled Values (SV) input handling using iec_61850_lib
 use crate::config::SvConfig;
 use std::error::Error;
+use socket2::{Socket, Domain, Type, Protocol};
+use iec_61850_lib::decode_basics::decode_ethernet_header;
+use iec_61850_lib::decode_smv::decode_smv;
+use iec_61850_lib::types::EthernetHeader;
 
 /// Sample data structure representing one sample from SV stream
 #[derive(Debug, Clone)]
@@ -16,17 +20,22 @@ pub struct SampleData {
 /// SV subscriber that receives sampled values from the network
 pub struct SvSubscriber {
     config: SvConfig,
+    socket: Option<Socket>,
 }
 
 impl SvSubscriber {
     /// Create a new SV subscriber with the given configuration
     pub fn new(config: SvConfig) -> Self {
-        Self { config }
+        Self { 
+            config,
+            socket: None,
+        }
     }
 
-    /// Initialize the subscriber (placeholder for actual implementation)
+    /// Initialize the subscriber with actual raw socket
     /// 
-    /// This would use iec_61850_lib to set up the network listener
+    /// This opens a raw Ethernet socket to receive SV packets
+    /// Requires CAP_NET_RAW capability or root privileges on Linux
     pub fn init(&mut self) -> Result<(), Box<dyn Error>> {
         log::info!(
             "Initializing SV subscriber on interface {} (MAC: {})",
@@ -34,27 +43,111 @@ impl SvSubscriber {
             self.config.multicast_mac
         );
         
-        // TODO: Implement actual SV subscription using iec_61850_lib
-        // This would involve:
-        // 1. Opening a raw socket on the specified interface
-        // 2. Subscribing to the multicast MAC address
-        // 3. Setting up the packet decoder
+        // Create raw socket for Ethernet (AF_PACKET on Linux)
+        #[cfg(target_os = "linux")]
+        {
+            
+            
+            
+            // Create raw packet socket (ETH_P_ALL = 0x0003 to receive all protocols)
+            let socket = Socket::new(
+                Domain::PACKET,
+                Type::RAW,
+                Some(Protocol::from(0x0003)), // ETH_P_ALL
+            )?;
+            
+            // Set socket to non-blocking mode
+            socket.set_nonblocking(true)?;
+            
+            // Bind to specific interface
+            let if_index = get_interface_index(&self.config.interface)?;
+            
+            // Create sockaddr_ll structure for binding
+            let mut addr_storage = [0u8; 128];
+            let _addr_len = bind_to_interface(&socket, if_index, &mut addr_storage)?;
+            
+            log::info!("Raw socket created and bound to interface {} (index: {})", 
+                       self.config.interface, if_index);
+            
+            self.socket = Some(socket);
+            Ok(())
+        }
         
-        Ok(())
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err("Raw socket SV reception is only supported on Linux".into())
+        }
     }
 
-    /// Receive the next sample from the SV stream (placeholder)
+    /// Receive the next sample from the SV stream
     /// 
-    /// This would use iec_61850_lib to decode incoming SV packets
+    /// This receives and decodes actual IEC 61850-9-2 SV packets from the network
+    /// Returns the first current sample from the first ASDU
     pub fn receive_sample(&mut self) -> Result<SampleData, Box<dyn Error>> {
-        // TODO: Implement actual SV packet reception and decoding
-        // This would involve:
-        // 1. Receiving raw Ethernet frame
-        // 2. Decoding IEC 61850-9-2 SV packet
-        // 3. Extracting sample data (current, voltage, timestamp)
+        let socket = self.socket.as_ref()
+            .ok_or("Socket not initialized. Call init() first.")?;
         
-        // Placeholder implementation
-        Err("SV reception not yet implemented".into())
+        // Buffer for receiving Ethernet frame (max 1522 bytes for standard Ethernet)
+        let mut buffer = vec![0u8; 2048];
+        let mut recv_buf: Vec<std::mem::MaybeUninit<u8>> = vec![std::mem::MaybeUninit::uninit(); 2048];
+        
+        loop {
+            // Receive packet (non-blocking)
+            let (len, _) = match socket.recv_from(&mut recv_buf) {
+                Ok((n, addr)) => (n, addr),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Err("No data available (non-blocking mode)".into());
+                }
+                Err(e) => return Err(Box::new(e)),
+            };
+            
+            // Copy to initialized buffer
+            for i in 0..len {
+                buffer[i] = unsafe { recv_buf[i].assume_init() };
+            }
+            
+            if len < 22 {
+                // Too small to be a valid Ethernet frame
+                continue;
+            }
+            
+            // Decode Ethernet header
+            let mut eth_header = EthernetHeader::default();
+            let pos = decode_ethernet_header(&mut eth_header, &buffer[0..len]);
+            
+            // Check if this is an SV packet (EtherType 0x88BA)
+            if eth_header.ether_type != [0x88, 0xBA] {
+                continue;
+            }
+            
+            // Decode SMV PDU
+            let pdu = match decode_smv(&buffer[0..len], pos) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::debug!("Failed to decode SMV PDU: {:?}", e);
+                    continue;
+                }
+            };
+            
+            // Extract sample data from first ASDU
+            if let Some(asdu) = pdu.sav_asdu.first() {
+                if let Some(sample) = asdu.all_data.first() {
+                    // Get current timestamp in microseconds
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_micros() as u64;
+                    
+                    return Ok(SampleData {
+                        current_adc: sample.value,
+                        sample_number: asdu.smp_cnt,
+                        timestamp,
+                    });
+                }
+            }
+            
+            log::debug!("Received SV packet but no samples found");
+        }
     }
 
     /// Get the configuration
@@ -65,6 +158,63 @@ impl SvSubscriber {
     /// Get the expected samples per cycle
     pub fn samples_per_cycle(&self) -> usize {
         self.config.samples_per_cycle
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn get_interface_index(interface: &str) -> Result<u32, Box<dyn Error>> {
+    use std::ffi::CString;
+    
+    let c_interface = CString::new(interface)?;
+    let index = unsafe { libc::if_nametoindex(c_interface.as_ptr()) };
+    
+    if index == 0 {
+        Err(format!("Interface '{}' not found", interface).into())
+    } else {
+        Ok(index)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn bind_to_interface(socket: &Socket, if_index: u32, addr_storage: &mut [u8]) -> Result<usize, Box<dyn Error>> {
+    use std::os::unix::io::AsRawFd;
+    
+    // Create sockaddr_ll structure
+    // struct sockaddr_ll {
+    //     unsigned short sll_family;   // AF_PACKET
+    //     unsigned short sll_protocol; // Physical layer protocol
+    //     int            sll_ifindex;  // Interface number
+    //     ...
+    // }
+    
+    let mut offset = 0;
+    
+    // sll_family (AF_PACKET = 17)
+    addr_storage[offset..offset+2].copy_from_slice(&17u16.to_ne_bytes());
+    offset += 2;
+    
+    // sll_protocol (ETH_P_ALL = 0x0003 in network byte order)
+    addr_storage[offset..offset+2].copy_from_slice(&0x0300u16.to_be_bytes());
+    offset += 2;
+    
+    // sll_ifindex
+    addr_storage[offset..offset+4].copy_from_slice(&(if_index as i32).to_ne_bytes());
+    
+    let addr_len = 20; // Size of sockaddr_ll
+    
+    // Bind socket
+    let ret = unsafe {
+        libc::bind(
+            socket.as_raw_fd(),
+            addr_storage.as_ptr() as *const libc::sockaddr,
+            addr_len as u32,
+        )
+    };
+    
+    if ret < 0 {
+        Err("Failed to bind socket to interface".into())
+    } else {
+        Ok(addr_len)
     }
 }
 
