@@ -6,6 +6,9 @@ use iec_61850_lib::decode_basics::decode_ethernet_header;
 use iec_61850_lib::decode_smv::decode_smv;
 use iec_61850_lib::types::EthernetHeader;
 
+#[cfg(target_os = "linux")]
+use super::network_utils::{get_interface_index, bind_to_interface, MAX_ETHERNET_FRAME_SIZE, MIN_ETHERNET_FRAME_SIZE};
+
 /// Sample data structure representing one sample from SV stream
 #[derive(Debug, Clone)]
 pub struct SampleData {
@@ -87,9 +90,9 @@ impl SvSubscriber {
         let socket = self.socket.as_ref()
             .ok_or("Socket not initialized. Call init() first.")?;
         
-        // Buffer for receiving Ethernet frame (max 1522 bytes for standard Ethernet)
-        let mut buffer = vec![0u8; 2048];
-        let mut recv_buf: Vec<std::mem::MaybeUninit<u8>> = vec![std::mem::MaybeUninit::uninit(); 2048];
+        // Buffer for receiving Ethernet frame
+        let mut buffer = vec![0u8; MAX_ETHERNET_FRAME_SIZE];
+        let mut recv_buf: Vec<std::mem::MaybeUninit<u8>> = vec![std::mem::MaybeUninit::uninit(); MAX_ETHERNET_FRAME_SIZE];
         
         loop {
             // Receive packet (non-blocking)
@@ -106,7 +109,7 @@ impl SvSubscriber {
                 buffer[i] = unsafe { recv_buf[i].assume_init() };
             }
             
-            if len < 22 {
+            if len < MIN_ETHERNET_FRAME_SIZE {
                 // Too small to be a valid Ethernet frame
                 continue;
             }
@@ -158,63 +161,6 @@ impl SvSubscriber {
     /// Get the expected samples per cycle
     pub fn samples_per_cycle(&self) -> usize {
         self.config.samples_per_cycle
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn get_interface_index(interface: &str) -> Result<u32, Box<dyn Error>> {
-    use std::ffi::CString;
-    
-    let c_interface = CString::new(interface)?;
-    let index = unsafe { libc::if_nametoindex(c_interface.as_ptr()) };
-    
-    if index == 0 {
-        Err(format!("Interface '{}' not found", interface).into())
-    } else {
-        Ok(index)
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn bind_to_interface(socket: &Socket, if_index: u32, addr_storage: &mut [u8]) -> Result<usize, Box<dyn Error>> {
-    use std::os::unix::io::AsRawFd;
-    
-    // Create sockaddr_ll structure
-    // struct sockaddr_ll {
-    //     unsigned short sll_family;   // AF_PACKET
-    //     unsigned short sll_protocol; // Physical layer protocol
-    //     int            sll_ifindex;  // Interface number
-    //     ...
-    // }
-    
-    let mut offset = 0;
-    
-    // sll_family (AF_PACKET = 17)
-    addr_storage[offset..offset+2].copy_from_slice(&17u16.to_ne_bytes());
-    offset += 2;
-    
-    // sll_protocol (ETH_P_ALL = 0x0003 in network byte order)
-    addr_storage[offset..offset+2].copy_from_slice(&0x0300u16.to_be_bytes());
-    offset += 2;
-    
-    // sll_ifindex
-    addr_storage[offset..offset+4].copy_from_slice(&(if_index as i32).to_ne_bytes());
-    
-    let addr_len = 20; // Size of sockaddr_ll
-    
-    // Bind socket
-    let ret = unsafe {
-        libc::bind(
-            socket.as_raw_fd(),
-            addr_storage.as_ptr() as *const libc::sockaddr,
-            addr_len as u32,
-        )
-    };
-    
-    if ret < 0 {
-        Err("Failed to bind socket to interface".into())
-    } else {
-        Ok(addr_len)
     }
 }
 
