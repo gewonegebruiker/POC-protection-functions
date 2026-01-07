@@ -1,0 +1,30 @@
+[package]
+name = "poc_protection_functions"
+version = "0.1.0"
+edition = "2021"
+authors = ["POC Protection Functions Contributors"]
+description = "IEC 61850 compliant protection functions in Rust"
+license = "Apache-2.0"
+repository = "https://github.com/gewonegebruiker/POC-protection-functions"
+
+[dependencies]
+iec_61850_lib = { git = "https://github.com/OpenEnergyTools/iec61850lib.git" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+log = "0.4"
+env_logger = "0.11"
+socket2 = { version = "0.5", features = ["all"] }
+libc = "0.2"
+
+[lib]
+name = "poc_protection_functions"
+path = "src/lib.rs"
+
+[[bin]]
+name = "poc_ptoc"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
