@@ -8,9 +8,11 @@ pub mod config;
 pub mod measurement;
 pub mod protection;
 pub mod io;
+pub mod diagnostics;
+pub mod scl;
 
 pub use config::{
-    SystemConfig, PtocConfig, CtConfig, AdcConfig, GooseConfig, SvConfig,
+    SystemConfig, PtocConfig, PiocConfig, CtConfig, AdcConfig, GooseConfig, SvConfig,
 };
 
 pub use measurement::{
@@ -19,13 +21,15 @@ pub use measurement::{
 };
 
 pub use protection::{
-    ProtectionFunction, ProtectionResult, TripState, Ptoc,
+    ProtectionFunction, ProtectionResult, TripState, Ptoc, PtocSlidingWindow, Pioc,
 };
 
 pub use io::{
     SampleData, SvSubscriber, SvSampleBuffer,
     GooseTripMessage, GoosePublisher,
 };
+
+pub use diagnostics::{LatencyTracker, LatencyStats};
 
 /// Version information
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

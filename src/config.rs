@@ -116,10 +116,29 @@ impl Default for SvConfig {
     }
 }
 
+/// Configuration for PIOC (Instantaneous Overcurrent Protection)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PiocConfig {
+    /// Pickup current in primary Amperes
+    pub iset: f64,
+    /// Enable/disable the protection function
+    pub enabled: bool,
+}
+
+impl Default for PiocConfig {
+    fn default() -> Self {
+        Self {
+            iset: 500.0, // 500A default instantaneous pickup
+            enabled: true,
+        }
+    }
+}
+
 /// Complete system configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemConfig {
     pub ptoc: PtocConfig,
+    pub pioc: PiocConfig,
     pub ct: CtConfig,
     pub adc: AdcConfig,
     pub goose: GooseConfig,
@@ -130,6 +149,7 @@ impl Default for SystemConfig {
     fn default() -> Self {
         Self {
             ptoc: PtocConfig::default(),
+            pioc: PiocConfig::default(),
             ct: CtConfig::default(),
             adc: AdcConfig::default(),
             goose: GooseConfig::default(),
