@@ -1,0 +1,32 @@
+{
+  "ptoc": {
+    "iset": 250.0,
+    "tset": 200,
+    "enabled": true
+  },
+  "pioc": {
+    "iset": 1000.0,
+    "enabled": true
+  },
+  "ct": {
+    "primary": 400.0,
+    "secondary": 1.0
+  },
+  "adc": {
+    "scale_factor": 0.001,
+    "offset": 0.0
+  },
+  "goose": {
+    "dst_mac": "01:0C:CD:01:00:02",
+    "appid": 2,
+    "goid": "BAY2_PTOC_TRIP",
+    "gocb_ref": "BAY2IED/PROT/LLN0$GO$GCB_PTOC",
+    "dat_set": "BAY2IED/PROT/LLN0$PTOC1",
+    "interface": "eth0"
+  },
+  "sv": {
+    "samples_per_cycle": 80,
+    "interface": "eth0",
+    "multicast_mac": "01:0C:CD:04:00:02"
+  }
+}
