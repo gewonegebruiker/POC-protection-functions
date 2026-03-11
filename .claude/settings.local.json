@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo test:*)",
+      "Bash(~/.cargo/bin/cargo test:*)",
+      "Bash(where.exe cargo:*)",
+      "Bash(cmd.exe /c \"where cargo\")",
+      "Bash(cmd.exe /c \"cargo test 2>&1\")",
+      "Bash(cmd.exe /c \"cd c:\\\\coding\\\\POC-protection-functions && cargo test 2>&1\")"
+    ]
+  }
+}

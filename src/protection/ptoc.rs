@@ -1,7 +1,36 @@
 /// PTOC (Time Overcurrent Protection) implementation
 use super::traits::{ProtectionFunction, ProtectionResult, TripState};
-use crate::config::PtocConfig;
+use crate::config::{PtocConfig, PtocCurve};
 use std::time::Duration;
+
+/// Compute the effective trip delay in milliseconds for a given curve and current ratio.
+///
+/// For `DefiniteTime`, returns `tset` unchanged.
+/// For inverse-time curves, `tset` acts as the time multiplier setting (TMS):
+/// `t_ms = tset × k / ((ratio)^α − 1)`, clamped to a minimum of 1 ms.
+/// Returns `u64::MAX` if `ratio ≤ 1.0` (current at or below pickup — no trip).
+pub(crate) fn effective_trip_delay_ms(curve: &PtocCurve, ratio: f64, tset: u64) -> u64 {
+    match curve {
+        PtocCurve::DefiniteTime => tset,
+        _ => {
+            if ratio <= 1.0 {
+                return u64::MAX;
+            }
+            let (k, alpha): (f64, f64) = match curve {
+                PtocCurve::IecStandardInverse  => (0.14,  0.02),
+                PtocCurve::IecVeryInverse       => (13.5,  1.0),
+                PtocCurve::IecExtremelyInverse  => (80.0,  2.0),
+                PtocCurve::DefiniteTime         => unreachable!(),
+            };
+            let denom = ratio.powf(alpha) - 1.0;
+            if denom <= 0.0 {
+                return u64::MAX;
+            }
+            let t_ms = tset as f64 * k / denom;
+            (t_ms.ceil() as u64).max(1)
+        }
+    }
+}
 
 /// PTOC protection function with definite time characteristic
 pub struct Ptoc {
@@ -54,6 +83,17 @@ impl Ptoc {
         current > self.config.iset
     }
 
+    /// Check if current is below the dropout threshold (for Pickup → Idle reset).
+    fn is_below_dropout(&self, current: f64) -> bool {
+        current < self.config.iset * self.config.dropout_ratio
+    }
+
+    /// Effective trip delay for the current value, considering the configured curve.
+    fn trip_delay_ms(&self, current: f64) -> u64 {
+        let ratio = if self.config.iset > 0.0 { current / self.config.iset } else { 0.0 };
+        effective_trip_delay_ms(&self.config.curve, ratio, self.config.tset)
+    }
+
     /// Calculate time elapsed since pickup in milliseconds
     fn time_since_pickup(&self, current_time: u64) -> Option<u64> {
         self.pickup_time.map(|pickup| {
@@ -71,46 +111,41 @@ impl ProtectionFunction for Ptoc {
 
         let is_overcurrent = self.is_overcurrent(current);
 
+        let delay_ms = self.trip_delay_ms(current);
+
         match self.state {
             TripState::Idle => {
                 if is_overcurrent {
-                    // Current exceeded pickup, start timing
                     self.state = TripState::Pickup;
                     self.pickup_time = Some(timestamp);
-                    ProtectionResult::TripPending(Duration::from_millis(self.config.tset))
+                    ProtectionResult::TripPending(Duration::from_millis(delay_ms))
                 } else {
                     ProtectionResult::NoTrip
                 }
             }
             TripState::Pickup => {
-                if !is_overcurrent {
-                    // Current dropped below pickup, reset
+                if self.is_below_dropout(current) {
+                    // Current dropped below dropout threshold — reset
                     self.state = TripState::Idle;
                     self.pickup_time = None;
                     ProtectionResult::NoTrip
                 } else {
-                    // Check if time delay has expired
+                    // Check if effective time delay has expired
                     if let Some(elapsed) = self.time_since_pickup(timestamp) {
-                        if elapsed >= self.config.tset {
-                            // Time delay expired, issue trip
+                        if elapsed >= delay_ms {
                             self.state = TripState::Trip;
                             ProtectionResult::Trip
                         } else {
-                            // Still waiting for time delay
-                            let remaining = self.config.tset - elapsed;
+                            let remaining = delay_ms.saturating_sub(elapsed);
                             ProtectionResult::TripPending(Duration::from_millis(remaining))
                         }
                     } else {
-                        // This shouldn't happen, but handle it gracefully
                         self.pickup_time = Some(timestamp);
-                        ProtectionResult::TripPending(Duration::from_millis(self.config.tset))
+                        ProtectionResult::TripPending(Duration::from_millis(delay_ms))
                     }
                 }
             }
-            TripState::Trip => {
-                // Once tripped, stay tripped until reset
-                ProtectionResult::Trip
-            }
+            TripState::Trip => ProtectionResult::Trip,
         }
     }
 
@@ -223,6 +258,48 @@ mod tests {
         let result = ptoc.process(150.0, 0);
         assert_eq!(result, ProtectionResult::Disabled);
         assert_eq!(ptoc.state(), TripState::Idle);
+    }
+
+    #[test]
+    fn test_ptoc_dropout_hysteresis_no_reset_above_threshold() {
+        // dropout_ratio = 0.95 → dropout threshold = 95 A
+        // Current drops to 96 A — above dropout threshold, must stay in Pickup
+        let config = PtocConfig { iset: 100.0, tset: 100, enabled: true, dropout_ratio: 0.95, ..PtocConfig::default() };
+        let mut ptoc = Ptoc::new(config);
+        ptoc.process(150.0, 0);
+        assert_eq!(ptoc.state(), TripState::Pickup);
+        let result = ptoc.process(96.0, 50_000);
+        assert!(matches!(result, ProtectionResult::TripPending(_)));
+        assert_eq!(ptoc.state(), TripState::Pickup);
+    }
+
+    #[test]
+    fn test_ptoc_dropout_hysteresis_resets_below_threshold() {
+        // Current drops to 94 A — below dropout threshold (95 A), must reset to Idle
+        let config = PtocConfig { iset: 100.0, tset: 100, enabled: true, dropout_ratio: 0.95, ..PtocConfig::default() };
+        let mut ptoc = Ptoc::new(config);
+        ptoc.process(150.0, 0);
+        assert_eq!(ptoc.state(), TripState::Pickup);
+        let result = ptoc.process(94.0, 50_000);
+        assert_eq!(result, ProtectionResult::NoTrip);
+        assert_eq!(ptoc.state(), TripState::Idle);
+    }
+
+    #[test]
+    fn test_ptoc_inverse_time_trips_faster_at_higher_current() {
+        use crate::config::PtocCurve;
+        // IEC Very Inverse: t = tset × 13.5 / (ratio − 1)
+        // At ratio=2 (200A): t = 100 × 13.5 / 1 = 1350 ms
+        // At ratio=5 (500A): t = 100 × 13.5 / 4 = 337 ms
+        let config = PtocConfig {
+            iset: 100.0, tset: 100, enabled: true,
+            dropout_ratio: 0.95, curve: PtocCurve::IecVeryInverse,
+        };
+        let delay_2x = effective_trip_delay_ms(&config.curve, 2.0, config.tset);
+        let delay_5x = effective_trip_delay_ms(&config.curve, 5.0, config.tset);
+        assert!(delay_5x < delay_2x, "Higher overcurrent should trip faster");
+        assert_eq!(delay_2x, 1350);
+        assert_eq!(delay_5x, 338); // ceil(337.5)
     }
 
     #[test]

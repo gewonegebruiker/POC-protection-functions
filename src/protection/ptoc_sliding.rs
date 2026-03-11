@@ -1,6 +1,7 @@
 //! Sliding Window PTOC — evaluates protection on every sample using
 //! an incremental O(1) RMS calculation for minimum detection latency.
 
+use super::ptoc::effective_trip_delay_ms;
 use super::traits::{ProtectionFunction, ProtectionResult, TripState};
 use crate::config::PtocConfig;
 use std::time::Duration;
@@ -100,34 +101,37 @@ impl PtocSlidingWindow {
 
     fn evaluate(&mut self, rms: f64, timestamp: u64) -> ProtectionResult {
         let overcurrent = rms > self.config.iset;
+        let below_dropout = rms < self.config.iset * self.config.dropout_ratio;
+        let ratio = if self.config.iset > 0.0 { rms / self.config.iset } else { 0.0 };
+        let delay_ms = effective_trip_delay_ms(&self.config.curve, ratio, self.config.tset);
 
         match self.state {
             TripState::Idle => {
                 if overcurrent {
                     self.state = TripState::Pickup;
                     self.pickup_time = Some(timestamp);
-                    ProtectionResult::TripPending(Duration::from_millis(self.config.tset))
+                    ProtectionResult::TripPending(Duration::from_millis(delay_ms))
                 } else {
                     ProtectionResult::NoTrip
                 }
             }
             TripState::Pickup => {
-                if !overcurrent {
+                if below_dropout {
                     self.state = TripState::Idle;
                     self.pickup_time = None;
                     ProtectionResult::NoTrip
                 } else if let Some(pickup) = self.pickup_time {
                     let elapsed_ms = timestamp.saturating_sub(pickup) / 1000;
-                    if elapsed_ms >= self.config.tset {
+                    if elapsed_ms >= delay_ms {
                         self.state = TripState::Trip;
                         ProtectionResult::Trip
                     } else {
-                        let remaining = self.config.tset - elapsed_ms;
+                        let remaining = delay_ms.saturating_sub(elapsed_ms);
                         ProtectionResult::TripPending(Duration::from_millis(remaining))
                     }
                 } else {
                     self.pickup_time = Some(timestamp);
-                    ProtectionResult::TripPending(Duration::from_millis(self.config.tset))
+                    ProtectionResult::TripPending(Duration::from_millis(delay_ms))
                 }
             }
             TripState::Trip => ProtectionResult::Trip,
@@ -297,6 +301,31 @@ mod tests {
             "Expected TripPending, got {:?}",
             result
         );
+    }
+
+    #[test]
+    fn test_dropout_hysteresis_no_reset_above_threshold() {
+        use crate::config::PtocConfig;
+        let config = PtocConfig { iset: 100.0, tset: 100, enabled: true, dropout_ratio: 0.95, ..PtocConfig::default() };
+        let mut ptoc = PtocSlidingWindow::new(config, 80);
+        fill(&mut ptoc, 150.0, 80, 0);
+        assert_eq!(ptoc.state(), TripState::Pickup);
+        // 96 A > 95 A (dropout threshold) → must stay in Pickup
+        let result = fill(&mut ptoc, 96.0, 80, 20_000);
+        assert!(matches!(result, ProtectionResult::TripPending(_)));
+        assert_eq!(ptoc.state(), TripState::Pickup);
+    }
+
+    #[test]
+    fn test_dropout_hysteresis_resets_below_threshold() {
+        use crate::config::PtocConfig;
+        let config = PtocConfig { iset: 100.0, tset: 100, enabled: true, dropout_ratio: 0.95, ..PtocConfig::default() };
+        let mut ptoc = PtocSlidingWindow::new(config, 80);
+        fill(&mut ptoc, 150.0, 80, 0);
+        assert_eq!(ptoc.state(), TripState::Pickup);
+        // 50 A < 95 A → must reset to Idle
+        fill(&mut ptoc, 50.0, 80, 20_000);
+        assert_eq!(ptoc.state(), TripState::Idle);
     }
 
     #[test]

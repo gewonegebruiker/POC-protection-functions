@@ -1,23 +1,59 @@
 /// Configuration structures for protection functions and I/O
 use serde::{Deserialize, Serialize};
 
+/// IEC/IEEE inverse-time overcurrent curve type.
+///
+/// When set to anything other than `DefiniteTime`, the effective trip delay is
+/// `tset × k / ((I/Iset)^α − 1)` where k and α are curve-dependent constants.
+/// `tset` acts as the **time multiplier setting (TMS)** in milliseconds.
+///
+/// Reference: IEC 60255-151, IEEE C37.112.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub enum PtocCurve {
+    /// Fixed time delay equal to `tset` (default).
+    #[default]
+    DefiniteTime,
+    /// IEC Standard Inverse  — k = 0.14, α = 0.02
+    IecStandardInverse,
+    /// IEC Very Inverse      — k = 13.5, α = 1.0
+    IecVeryInverse,
+    /// IEC Extremely Inverse — k = 80,   α = 2.0
+    IecExtremelyInverse,
+}
+
 /// Configuration for PTOC (Time Overcurrent Protection)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PtocConfig {
     /// Pickup current in primary Amperes
     pub iset: f64,
-    /// Definite time delay in milliseconds
+    /// Definite time delay in milliseconds (also acts as TMS for inverse-time curves)
     pub tset: u64,
     /// Enable/disable the protection function
     pub enabled: bool,
+    /// Dropout ratio — current must fall below `iset × dropout_ratio` to reset from
+    /// Pickup back to Idle.  Values < 1.0 add hysteresis (e.g. 0.95).
+    /// Default 0.95.
+    #[serde(default = "PtocConfig::default_dropout_ratio")]
+    pub dropout_ratio: f64,
+    /// Inverse-time curve selection. Default: `DefiniteTime`.
+    #[serde(default)]
+    pub curve: PtocCurve,
+}
+
+impl PtocConfig {
+    fn default_dropout_ratio() -> f64 {
+        0.95
+    }
 }
 
 impl Default for PtocConfig {
     fn default() -> Self {
         Self {
-            iset: 100.0,  // 100A default pickup
-            tset: 100,    // 100ms default delay
+            iset: 100.0,
+            tset: 100,
             enabled: true,
+            dropout_ratio: 0.95,
+            curve: PtocCurve::DefiniteTime,
         }
     }
 }
@@ -116,20 +152,46 @@ impl Default for SvConfig {
     }
 }
 
+/// Selects how the input current value is interpreted by PIOC.
+///
+/// - `Instantaneous`: the caller supplies the raw instantaneous sample (absolute value).
+///   `iset` must be set as a **peak** threshold (i.e. `iset_rms × √2`).
+/// - `ShortWindowRms(n)`: PIOC maintains an internal n-sample sliding-window RMS.
+///   `iset` is then an RMS threshold, reducing noise sensitivity at the cost of a few
+///   sample periods of additional detection latency.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum PiocInputMode {
+    /// Use the instantaneous absolute sample value directly (default).
+    Instantaneous,
+    /// Compute an n-sample sliding RMS internally before comparing to `iset`.
+    ShortWindowRms(usize),
+}
+
+impl Default for PiocInputMode {
+    fn default() -> Self {
+        PiocInputMode::Instantaneous
+    }
+}
+
 /// Configuration for PIOC (Instantaneous Overcurrent Protection)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PiocConfig {
-    /// Pickup current in primary Amperes
+    /// Pickup current in primary Amperes.
+    /// For `Instantaneous` mode this is a **peak** threshold; for `ShortWindowRms` it is RMS.
     pub iset: f64,
     /// Enable/disable the protection function
     pub enabled: bool,
+    /// How the input value is interpreted. Default: `Instantaneous`.
+    #[serde(default)]
+    pub input_mode: PiocInputMode,
 }
 
 impl Default for PiocConfig {
     fn default() -> Self {
         Self {
-            iset: 500.0, // 500A default instantaneous pickup
+            iset: 500.0,
             enabled: true,
+            input_mode: PiocInputMode::Instantaneous,
         }
     }
 }

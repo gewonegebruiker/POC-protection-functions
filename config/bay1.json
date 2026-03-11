@@ -2,11 +2,14 @@
   "ptoc": {
     "iset": 300.0,
     "tset": 100,
-    "enabled": true
+    "enabled": true,
+    "dropout_ratio": 0.95,
+    "curve": "DefiniteTime"
   },
   "pioc": {
     "iset": 1200.0,
-    "enabled": true
+    "enabled": true,
+    "input_mode": "Instantaneous"
   },
   "ct": {
     "primary": 400.0,

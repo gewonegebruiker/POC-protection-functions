@@ -5,5 +5,5 @@ pub mod goose_output;
 #[cfg(target_os = "linux")]
 pub mod network_utils;
 
-pub use sv_input::{SampleData, SvSubscriber, SvSampleBuffer};
+pub use sv_input::{SampleData, ThreePhaseSampleData, SvSubscriber, SvSampleBuffer};
 pub use goose_output::{GooseTripMessage, GoosePublisher};

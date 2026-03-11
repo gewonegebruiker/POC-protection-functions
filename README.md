@@ -12,32 +12,38 @@ This project implements protection functions according to the IEC 61850 standard
 
 ### Currently Implemented
 
-- **PTOC (Time Overcurrent Protection)** - Definite time characteristic
-  - Configurable pickup current (Iset)
-  - Configurable time delay (Tset)
-  - RMS calculation from 80 samples per cycle (50 Hz)
+| Function | Description | Standard |
+|----------|-------------|----------|
+| **PTOC** — definite-time | Fixed delay, dropout hysteresis | IEC 61850-7-4 |
+| **PTOC** — inverse-time | IEC Standard / Very / Extremely Inverse curves | IEC 60255-151 |
+| **PTOC** — sliding-window | Per-sample O(1) RMS (production path) | — |
+| **PIOC** — instantaneous | Single-sample peak detection | IEC 61850-7-4 |
+| **PIOC** — short-window RMS | Internal n-sample ring-buffer RMS, noise-resistant | — |
+| **GOOSE retransmission** | Accelerated schedule (2/4/8/16 ms) + 1 s heartbeat | IEC 61850-8-1 |
+| **Live I/O** | SV → scaling → protection → GOOSE, end-to-end | — |
 
 ## Architecture
 
 ```
-┌─────────────┐     ┌──────────────┐     ┌─────────────┐
-│ Sampled     │────▶│  Protection  │────▶│   GOOSE     │
-│ Values (SV) │     │  Function    │     │   Output    │
-│             │     │   (PTOC)     │     │   (Trip)    │
-└─────────────┘     └──────────────┘     └─────────────┘
-      │                     │                    │
-      │                     │                    │
-   ADC + CT              RMS Calc            IEC 61850-8-1
-   Scaling            Definite Time          Encoding
+┌──────────────────┐     ┌───────────────────────────────┐    ┌─────────────────┐
+│  Sampled Values  │───▶│     Protection Functions      │───▶│   GOOSE Output  │
+│  (IEC 61850-9-2) │     │                               │    │  (IEC 61850-8-1)│
+│  SvSubscriber    │     │  PtocSlidingWindow  (PTOC)    │    │  GoosePublisher │
+│  adc_to_primary  │     │  Pioc               (PIOC)    │    │  tick() + RT    │
+└──────────────────┘     └───────────────────────────────┘    └─────────────────┘
+         │                           │                                │
+    ADC + CT                  Sliding RMS                    Retransmit Schedule
+    Scaling               Dropout Hysteresis              2/4/8/16 ms → 1 s HB
+                          Inverse-Time Curves
 ```
 
 ### Data Flow
 
-1. **SV Input**: Receive 80 samples per cycle (4000 samples/sec at 50 Hz)
-2. **Scaling**: Apply ADC scaling and CT ratio conversion
-3. **RMS Calculation**: Calculate RMS current over one cycle
-4. **Protection Logic**: Compare against pickup setting with time delay
-5. **GOOSE Output**: Send trip signal when threshold exceeded
+1. **SV Input** — receive 80 samples/cycle (4000 Sa/s at 50 Hz) via raw Ethernet socket
+2. **Scaling** — `adc_to_primary()` converts ADC counts → primary Amperes
+3. **PIOC** — compares `|sample|` (or short-window RMS) to `iset`; trips in < 1 µs
+4. **PTOC** — per-sample sliding-window RMS; definite-time or inverse-time trip delay
+5. **GOOSE** — `publish_trip()` on state change; `tick()` drives retransmission schedule
 
 ## Building and Running
 
@@ -53,23 +59,28 @@ This project implements protection functions according to the IEC 61850 standard
 cargo build --release
 ```
 
-### Run Example Application
+### Run — simulation mode (default, no hardware needed)
 
 ```bash
 cargo run --release
 ```
 
-This runs a simulation that demonstrates the PTOC function with overcurrent detection.
+Runs 15 synthetic cycles (10 overcurrent then 5 normal) demonstrating PTOC/PIOC detection.
 
-**Note**: The example runs in simulation mode. For live network operation with actual SV/GOOSE packets, you need root privileges or CAP_NET_RAW capability.
-
-### Run Test Example
+### Run — live I/O mode
 
 ```bash
-cargo run --example ptoc_test
+# Build first
+cargo build --release
+
+# Grant capability once
+sudo setcap cap_net_raw+ep target/release/poc_ptoc
+
+# Run with bay config
+IED_CONFIG=config/bay1.json IED_LIVE=1 ./target/release/poc_ptoc
 ```
 
-This runs a simple test showing PTOC behavior with different current levels.
+`IED_LIVE=1` switches from the synthetic loop to the real SV → GOOSE path.
 
 ### Run Tests
 
@@ -79,304 +90,220 @@ cargo test
 
 ## Live Network I/O
 
-The implementation now includes **full IEC 61850 network integration** using `iec_61850_lib` with raw socket support:
+Set `IED_LIVE=1` to switch from the built-in simulation to the real network path.
 
-### SV Subscriber (Receiving Sampled Values)
+### SV Subscriber
 
 ```rust
-use poc_protection_functions::{SvSubscriber, SvConfig};
+use poc_protection_functions::{SvSubscriber, adc_to_primary};
 
-let config = SvConfig {
-    samples_per_cycle: 80,
-    interface: "eth0".to_string(),
-    multicast_mac: "01:0C:CD:04:00:00".to_string(),
-};
+let mut sv = SvSubscriber::new(config.sv.clone());
+sv.init()?;  // requires CAP_NET_RAW on Linux
 
-let mut subscriber = SvSubscriber::new(config);
-subscriber.init()?;  // Requires CAP_NET_RAW
-
-// Receive samples (non-blocking)
-match subscriber.receive_sample() {
+match sv.receive_sample() {        // non-blocking
     Ok(sample) => {
-        println!("Current ADC: {}", sample.current_adc);
-        // Process sample...
+        let primary = adc_to_primary(sample.current_adc, &config.adc, &config.ct);
+        // feed into protection functions
     }
-    Err(e) => println!("No data: {}", e),
+    Err(e) if e.to_string().contains("No data available") => {} // WouldBlock — spin
+    Err(e) => return Err(e),
 }
 ```
 
-### GOOSE Publisher (Sending Trip Signals)
+### GOOSE Publisher with Retransmission
 
 ```rust
-use poc_protection_functions::{GoosePublisher, GooseConfig};
+let mut goose = GoosePublisher::new(config.goose.clone());
+goose.init()?;
 
-let config = GooseConfig {
-    dst_mac: "01:0C:CD:01:00:00".to_string(),
-    appid: 0x0001,
-    goid: "PTOC_TRIP".to_string(),
-    gocb_ref: "IED1LD0/LLN0$GO$PTOC1".to_string(),
-    dat_set: "IED1LD0/LLN0$PTOC1".to_string(),
-    interface: "eth0".to_string(),
-};
+loop {
+    let now = get_timestamp_micros();
+    goose.tick(now)?;                        // retransmit / heartbeat if due
 
-let mut publisher = GoosePublisher::new(config);
-publisher.init()?;  // Requires CAP_NET_RAW
-
-// Send trip message
-let timestamp = get_timestamp_micros();
-publisher.publish_trip(true, timestamp)?;  // Sends actual GOOSE frame
+    if trip != goose.last_trip_state() {
+        goose.publish_trip(trip, now)?;      // state change → resets retransmit schedule
+    }
+}
 ```
 
-### Privileges Required
+`tick()` retransmits at +2 ms, +4 ms, +8 ms, +16 ms after a state change, then every 1 s.
 
-Raw socket operations require elevated privileges:
+### Privileges
 
-**Option 1: Run as root**
 ```bash
-sudo cargo run --release
-```
-
-**Option 2: Grant CAP_NET_RAW capability**
-```bash
-# Build first
-cargo build --release
-
-# Grant capability to binary
 sudo setcap cap_net_raw+ep target/release/poc_ptoc
-
-# Now can run without sudo
-./target/release/poc_ptoc
+IED_CONFIG=config/bay1.json IED_LIVE=1 ./target/release/poc_ptoc
 ```
 
 ### Network Setup
 
-For live operation:
-1. Connect IED/test equipment to same Ethernet network
-2. Configure correct network interface (`eth0`, `enp0s3`, etc.)
-3. Set multicast MAC addresses to match your equipment:
-   - SV typically uses `01:0C:CD:04:XX:XX`
-   - GOOSE typically uses `01:0C:CD:01:XX:XX`
+1. Connect IED/test equipment to the same Ethernet network
+2. Set correct `interface` in the config file
+3. Match multicast MACs: SV `01:0C:CD:04:XX:XX`, GOOSE `01:0C:CD:01:XX:XX`
 4. Ensure no firewall blocks raw Ethernet frames
 
 ## Configuration
 
-The system is configured through `SystemConfig` which includes:
+Configuration is loaded from a JSON file. Path is set via the `IED_CONFIG` environment variable (defaults to `config/ied.json`). Bay-specific examples: `config/bay1.json`, `config/bay2.json`.
 
-### PTOC Configuration
-
-```rust
-PtocConfig {
-    iset: 100.0,      // Pickup current in primary Amperes
-    tset: 100,        // Definite time delay in milliseconds
-    enabled: true,    // Enable/disable the function
-}
-```
-
-### CT (Current Transformer) Configuration
-
-```rust
-CtConfig {
-    primary: 400.0,   // Primary current rating (e.g., 400A)
-    secondary: 1.0,   // Secondary current rating (typically 1A or 5A)
-}
-```
-
-The CT ratio is automatically calculated as `primary / secondary` (e.g., 400/1 = 400).
-
-### ADC (Analog-to-Digital Converter) Configuration
-
-```rust
-AdcConfig {
-    scale_factor: 0.001,  // Converts ADC counts to secondary amperes
-    offset: 0.0,          // Zero point correction
-}
-```
-
-### GOOSE Output Configuration
-
-```rust
-GooseConfig {
-    dst_mac: "01:0C:CD:01:00:00".to_string(),  // Multicast MAC address
-    appid: 0x0001,                              // Application ID
-    goid: "PTOC_TRIP".to_string(),              // GOOSE ID
-    gocb_ref: "IED1LD0/LLN0$GO$PTOC1".to_string(),  // Control block reference
-    dat_set: "IED1LD0/LLN0$PTOC1".to_string(),  // Dataset reference
-    interface: "eth0".to_string(),              // Network interface
-}
-```
-
-### Sampled Values Input Configuration
-
-```rust
-SvConfig {
-    samples_per_cycle: 80,                          // 80 samples @ 50Hz = 4000 samples/sec
-    interface: "eth0".to_string(),                  // Network interface
-    multicast_mac: "01:0C:CD:04:00:00".to_string(), // SV multicast address
-}
-```
-
-### Configuration File
-
-You can save and load configuration from JSON:
-
-```rust
-// Save configuration
-let config = SystemConfig::default();
-config.to_json_file("config.json")?;
-
-// Load configuration
-let config = SystemConfig::from_json_file("config.json")?;
-```
-
-Example `config.json`:
+### PTOC
 
 ```json
-{
-  "ptoc": {
-    "iset": 100.0,
-    "tset": 100,
-    "enabled": true
-  },
-  "ct": {
-    "primary": 400.0,
-    "secondary": 1.0
-  },
-  "adc": {
-    "scale_factor": 0.001,
-    "offset": 0.0
-  },
-  "goose": {
-    "dst_mac": "01:0C:CD:01:00:00",
-    "appid": 1,
-    "goid": "PTOC_TRIP",
-    "gocb_ref": "IED1LD0/LLN0$GO$PTOC1",
-    "dat_set": "IED1LD0/LLN0$PTOC1",
-    "interface": "eth0"
-  },
-  "sv": {
-    "samples_per_cycle": 80,
-    "interface": "eth0",
-    "multicast_mac": "01:0C:CD:04:00:00"
-  }
+"ptoc": {
+  "iset": 300.0,
+  "tset": 100,
+  "enabled": true,
+  "dropout_ratio": 0.95,
+  "curve": "DefiniteTime"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `iset` | `f64` | Pickup current in primary Amperes |
+| `tset` | `u64` | Time delay in ms (acts as TMS for inverse-time curves) |
+| `enabled` | `bool` | Enable / disable |
+| `dropout_ratio` | `f64` | Current must fall below `iset × ratio` to reset (default 0.95) |
+| `curve` | string | `"DefiniteTime"` \| `"IecStandardInverse"` \| `"IecVeryInverse"` \| `"IecExtremelyInverse"` |
+
+Inverse-time formula (IEC 60255-151): `t = tset × k / ((I/Iset)^α − 1)`
+
+| Curve | k | α |
+|-------|---|---|
+| IEC Standard Inverse | 0.14 | 0.02 |
+| IEC Very Inverse | 13.5 | 1.0 |
+| IEC Extremely Inverse | 80.0 | 2.0 |
+
+### PIOC
+
+```json
+"pioc": {
+  "iset": 1200.0,
+  "enabled": true,
+  "input_mode": "Instantaneous"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `iset` | `f64` | Pickup — **peak** A for `Instantaneous`, **RMS** A for `ShortWindowRms` |
+| `enabled` | `bool` | Enable / disable |
+| `input_mode` | string/object | `"Instantaneous"` or `{"ShortWindowRms": 8}` |
+
+### CT, ADC, GOOSE, SV
+
+```json
+"ct":  { "primary": 400.0, "secondary": 1.0 },
+"adc": { "scale_factor": 0.001, "offset": 0.0 },
+"goose": {
+  "dst_mac": "01:0C:CD:01:00:01",
+  "appid": 1,
+  "goid": "BAY1_PTOC_TRIP",
+  "gocb_ref": "BAY1IED/PROT/LLN0$GO$GCB_PTOC",
+  "dat_set": "BAY1IED/PROT/LLN0$PTOC1",
+  "interface": "eth0"
+},
+"sv": {
+  "samples_per_cycle": 80,
+  "interface": "eth0",
+  "multicast_mac": "01:0C:CD:04:00:01"
 }
 ```
 
 ## Usage with Omicron Test Equipment
 
-### Test Setup
+1. **Configure Omicron** SV output: 50 Hz, 4000 Sa/s, desired amplitude
+2. **Configure GOOSE subscriber** in Omicron: subscribe to configured multicast MAC / APPID
+3. **Network**: connect Omicron and IED to the same switch; use a dedicated NIC
 
-1. **Configure Omicron** to output Sampled Values (SV):
-   - Frequency: 50 Hz
-   - Sample rate: 4000 samples/second (80 samples/cycle)
-   - Current amplitude: Configure based on test requirements
+### Example Test Scenarios
 
-2. **Configure GOOSE Subscriber** in Omicron:
-   - Subscribe to the configured GOOSE multicast address
-   - Monitor for trip signal from the PTOC function
-
-3. **Network Setup**:
-   - Connect Omicron and protection device to same Ethernet network
-   - Use dedicated network interface for IEC 61850 traffic
-   - Configure MAC addresses and APPID to match Omicron settings
-
-### Example Test Scenario
-
-**Test Definite Time Overcurrent:**
-
-1. Set PTOC parameters: Iset = 100A, Tset = 100ms
-2. Apply normal load current (< 100A) - verify no trip
-3. Apply overcurrent (> 100A) - verify trip after 100ms
-4. Reduce current below 100A before 100ms - verify no trip
-5. Apply sustained overcurrent - verify trip persists
+| Test | Setup | Expected |
+|------|-------|----------|
+| Below pickup | I = 0.8× Iset | No trip |
+| Definite-time trip | I = 1.5× Iset held > Tset | Trip after Tset ms |
+| Dropout (no trip) | I = 1.5× Iset, remove < Tset | No trip; resets to Idle |
+| Instantaneous (PIOC) | I = 10× Iset | Trip within 1–2 samples (< 1 ms) |
+| Inverse-time faster | I = 5× vs 2× Iset | Higher fault trips sooner |
 
 ## Project Structure
 
 ```
 POC-protection-functions/
-├── Cargo.toml                  # Project dependencies
-├── README.md                   # This file
-├── .github/
-│   └── copilot-instructions.md # Copilot context
+├── Cargo.toml
+├── config/
+│   ├── bay1.json               # Bay 1 settings
+│   └── bay2.json               # Bay 2 settings
 ├── src/
-│   ├── lib.rs                  # Library root
-│   ├── main.rs                 # Example application
-│   ├── config.rs               # Configuration structures
+│   ├── lib.rs                  # Public API re-exports
+│   ├── main.rs                 # RT event loop (sim + live modes)
+│   ├── config.rs               # All config structs + serde
 │   ├── protection/
-│   │   ├── mod.rs
-│   │   ├── traits.rs           # ProtectionFunction trait
-│   │   └── ptoc.rs             # PTOC implementation
+│   │   ├── traits.rs           # ProtectionFunction trait, ProtectionResult, TripState
+│   │   ├── ptoc.rs             # PTOC — definite + inverse-time, dropout hysteresis
+│   │   ├── ptoc_sliding.rs     # PTOC with per-sample sliding-window RMS
+│   │   ├── pioc.rs             # PIOC — instantaneous or short-window RMS
+│   │   └── three_phase.rs      # ThreePhasePtoc + ThreePhasePioc
 │   ├── measurement/
-│   │   ├── mod.rs
-│   │   ├── rms.rs              # RMS calculation
-│   │   └── scaling.rs          # CT ratio, ADC scaling
-│   └── io/
-│       ├── mod.rs
-│       ├── sv_input.rs         # SV subscriber
-│       └── goose_output.rs     # GOOSE publisher
-└── examples/
-    └── ptoc_test.rs            # Simple test setup
+│   │   ├── rms.rs              # RMS calculation (cycle + incremental)
+│   │   └── scaling.rs          # adc_to_primary, CurrentScaler
+│   ├── io/
+│   │   ├── sv_input.rs         # SvSubscriber — raw socket, IEC 61850-9-2 decode
+│   │   └── goose_output.rs     # GoosePublisher — raw socket, retransmission scheduler
+│   ├── diagnostics/
+│   │   └── latency.rs          # LatencyTracker — p50/p99/max statistics
+│   └── scl/                    # SCL/SCD parser skeleton (Phase 2)
+└── docs/
+    ├── ARCHITECTURE.md
+    ├── ROADMAP.md
+    └── modules/                # Per-module deep-dives
 ```
-
-## Key Modules
-
-### Protection Functions (`src/protection/`)
-
-- **traits.rs**: Defines the `ProtectionFunction` trait that all protection functions implement
-- **ptoc.rs**: Time Overcurrent Protection with definite time characteristic
-
-### Measurement (`src/measurement/`)
-
-- **rms.rs**: RMS calculation from sampled values (supports 80 samples per cycle)
-- **scaling.rs**: Current scaling (ADC → secondary → primary conversion)
-
-### I/O (`src/io/`)
-
-- **sv_input.rs**: Sampled Values subscriber (uses `iec_61850_lib`)
-- **goose_output.rs**: GOOSE publisher for trip signals (uses `iec_61850_lib`)
 
 ## IEC 61850 Compliance
 
 ### Logical Nodes
 
-- **PTOC**: Time overcurrent (implemented)
-- **XCBR**: Circuit breaker (future)
-- **PDIF**: Differential protection (future)
-- **PDIS**: Distance protection (future)
+| Node | Status |
+|------|--------|
+| **PTOC** | Implemented — definite-time + IEC inverse-time curves |
+| **PIOC** | Implemented — instantaneous + short-window RMS mode |
+| **XCBR** | Future |
+| **PDIF** | Future |
+| **PDIS** | Future |
 
 ### Communication
 
-- **IEC 61850-9-2 (Sampled Values)**:
-  - Receives current measurements over Ethernet
-  - 80 samples per cycle at 50 Hz (4000 samples/second)
-  - Multicast communication
+- **IEC 61850-9-2 (SV)** — raw Ethernet, 80 Sa/cycle at 50 Hz, multicast
+- **IEC 61850-8-1 (GOOSE)** — raw Ethernet, accelerated retransmit schedule, `stNum`/`sqNum` compliant
 
-- **IEC 61850-8-1 (GOOSE)**:
-  - Sends trip signals over Ethernet
-  - Fast transmission (< 4ms)
-  - State-based messaging with sequence numbers
-  - Compatible with standard IED test equipment
+## Roadmap
 
-## Future Roadmap
+### Completed
+- [x] PTOC definite-time + sliding-window RMS
+- [x] PTOC inverse-time curves (Standard / Very / Extremely Inverse)
+- [x] PTOC dropout hysteresis
+- [x] PIOC instantaneous + short-window RMS input mode
+- [x] GOOSE IEC 61850-8-1 retransmission scheduler + heartbeat
+- [x] Live I/O — SV → protection → GOOSE (`IED_LIVE=1`)
+- [x] JSON-driven per-bay configuration
+- [x] Latency tracker (p50 / p99 / max)
+- [x] Container image + docker-compose deployment
 
 ### Near Term
-- [ ] Complete integration with `iec_61850_lib` for actual SV/GOOSE communication
-- [ ] Add PTOC inverse time curves (IEC 255, IEEE C37.112)
-- [ ] Add configuration validation and error handling
-- [ ] Add detailed logging and diagnostics
+- [x] Three-phase PTOC/PIOC — trip on any of phases A, B, C
+- [ ] External reset from XCBR GOOSE message
+- [ ] End-to-end HIL test with Omicron (PTOC ≤ P3, PIOC ≤ P1)
 
-### Medium Term
-- [ ] **PDIF**: Differential protection function
-- [ ] **PDIS**: Distance protection function
-- [ ] **XCBR**: Circuit breaker logical node
-- [ ] Web-based configuration interface
-- [ ] Real-time monitoring and visualization
+### Phase 2 — SCD-Driven Configuration
+- [ ] XML SCD parser (IED, LN, DataSet, SV, GOOSE sections)
+- [ ] Map PTOC/PIOC data attributes from SCL
+- [ ] Deploy bay from SCD with no manual JSON editing
 
 ### Long Term
-- [ ] Multiple protection zones
-- [ ] Breaker failure protection
-- [ ] Fault recording
-- [ ] Integration with SCADA systems
-- [ ] IEC 61850 MMS server for configuration
+- [ ] MMS server (LLN0, LPHD, PTOC1, PIOC1 data model)
+- [ ] PDIF differential protection
+- [ ] RBRF breaker failure protection
+- [ ] PRP/HSR network redundancy
 
 ## Dependencies
 

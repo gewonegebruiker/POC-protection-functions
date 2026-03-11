@@ -8,6 +8,15 @@ use iec_61850_lib::types::{EthernetHeader, IECGoosePdu, IECData};
 #[cfg(target_os = "linux")]
 use super::network_utils::{get_interface_index, bind_to_interface, get_interface_mac, DEFAULT_SRC_MAC, SOCKADDR_LL_SIZE};
 
+/// IEC 61850-8-1 retransmission intervals after a state change (milliseconds).
+/// Each interval doubles the previous one; after the last entry the publisher
+/// switches to the steady-state heartbeat interval.
+const RETRANSMIT_SCHEDULE_MS: [u64; 4] = [2, 4, 8, 16];
+
+/// Steady-state GOOSE heartbeat interval (milliseconds) — sent when no state
+/// change has occurred recently so that subscribers can detect loss-of-signal.
+const HEARTBEAT_MS: u64 = 1_000;
+
 /// GOOSE trip message data
 #[derive(Debug, Clone)]
 pub struct GooseTripMessage {
@@ -21,7 +30,13 @@ pub struct GooseTripMessage {
     pub timestamp: u64,
 }
 
-/// GOOSE publisher that sends trip messages over the network
+/// GOOSE publisher that sends trip messages over the network.
+///
+/// After every state change, retransmissions are scheduled according to
+/// `RETRANSMIT_SCHEDULE_MS` (2 ms, 4 ms, 8 ms, 16 ms) and then fall back to
+/// a steady-state heartbeat every `HEARTBEAT_MS` ms so that subscribers can
+/// detect loss-of-signal.  Call [`GoosePublisher::tick`] on every sample
+/// iteration to send retransmissions when they are due.
 pub struct GoosePublisher {
     config: GooseConfig,
     sq_num: u32,
@@ -29,18 +44,29 @@ pub struct GoosePublisher {
     last_trip_state: bool,
     socket: Option<Socket>,
     src_mac: [u8; 6],
+    /// Timestamp (µs) at which the next retransmission or heartbeat is due.
+    next_retransmit_us: u64,
+    /// Index into `RETRANSMIT_SCHEDULE_MS`; >= len means we are in heartbeat phase.
+    retransmit_step: usize,
 }
 
 impl GoosePublisher {
-    /// Create a new GOOSE publisher with the given configuration
+    /// Create a new GOOSE publisher with the given configuration.
     pub fn new(config: GooseConfig) -> Self {
+        #[cfg(target_os = "linux")]
+        let src_mac = DEFAULT_SRC_MAC;
+        #[cfg(not(target_os = "linux"))]
+        let src_mac = [0x00u8; 6];
+
         Self {
             config,
             sq_num: 0,
             st_num: 0,
             last_trip_state: false,
             socket: None,
-            src_mac: DEFAULT_SRC_MAC,
+            src_mac,
+            next_retransmit_us: 0,
+            retransmit_step: RETRANSMIT_SCHEDULE_MS.len(), // start in heartbeat phase
         }
     }
 
@@ -102,7 +128,10 @@ impl GoosePublisher {
         if state_changed {
             self.st_num += 1;
             self.last_trip_state = trip;
-            
+            // Reset retransmission schedule
+            self.retransmit_step = 0;
+            self.next_retransmit_us = timestamp + RETRANSMIT_SCHEDULE_MS[0] * 1_000;
+
             log::info!(
                 "GOOSE trip state changed: {} (stNum: {}, sqNum: {})",
                 if trip { "TRIP" } else { "NORMAL" },
@@ -238,11 +267,36 @@ impl GoosePublisher {
         self.last_trip_state
     }
 
+    /// Send a retransmission or heartbeat if one is due at `now_us`.
+    ///
+    /// Should be called on every sample iteration.  Returns `true` if a frame
+    /// was sent.  Safe to call even before any [`publish_trip`] — the initial
+    /// `next_retransmit_us` is 0 so the first tick after startup sends the
+    /// initial heartbeat immediately.
+    pub fn tick(&mut self, now_us: u64) -> Result<bool, Box<dyn Error>> {
+        if now_us < self.next_retransmit_us {
+            return Ok(false);
+        }
+        let trip = self.last_trip_state;
+        self.publish_trip(trip, now_us)?;
+        // Advance the retransmit schedule
+        if self.retransmit_step < RETRANSMIT_SCHEDULE_MS.len() {
+            let interval_us = RETRANSMIT_SCHEDULE_MS[self.retransmit_step] * 1_000;
+            self.next_retransmit_us = now_us + interval_us;
+            self.retransmit_step += 1;
+        } else {
+            self.next_retransmit_us = now_us + HEARTBEAT_MS * 1_000;
+        }
+        Ok(true)
+    }
+
     /// Reset the publisher state
     pub fn reset(&mut self) {
         self.sq_num = 0;
         self.st_num = 0;
         self.last_trip_state = false;
+        self.next_retransmit_us = 0;
+        self.retransmit_step = RETRANSMIT_SCHEDULE_MS.len();
     }
 }
 
@@ -315,6 +369,48 @@ mod tests {
         publisher.publish_trip(false, 3000).unwrap();
         assert_eq!(publisher.st_num(), 2);
         assert_eq!(publisher.sq_num(), 3);
+    }
+
+    #[test]
+    fn test_retransmit_schedule_after_state_change() {
+        // Retransmit schedule (µs offsets from state-change call):
+        //  t=0      publish_trip (state change)
+        //  t=2 000  tick send → interval=2 ms  → next=4 000, step=1
+        //  t=4 000  tick send → interval=4 ms  → next=8 000, step=2
+        //  t=8 000  tick send → interval=8 ms  → next=16 000, step=3
+        //  t=16 000 tick send → interval=16 ms → next=32 000, step=4
+        //  t=32 000 tick send → heartbeat       → next=32 000+1 000 000
+        let config = GooseConfig::default();
+        let mut publisher = GoosePublisher::new(config);
+
+        // State change at t=0 µs → first retransmit scheduled at +2 ms
+        publisher.publish_trip(true, 0).unwrap();
+        assert_eq!(publisher.retransmit_step, 0);
+        assert_eq!(publisher.next_retransmit_us, 2_000);
+
+        // tick before deadline → no send
+        assert!(!publisher.tick(1_000).unwrap());
+
+        // Walk the four rapid retransmits
+        assert!(publisher.tick(2_000).unwrap());
+        assert_eq!(publisher.retransmit_step, 1);
+        assert_eq!(publisher.next_retransmit_us, 4_000);
+
+        assert!(publisher.tick(4_000).unwrap());
+        assert_eq!(publisher.retransmit_step, 2);
+        assert_eq!(publisher.next_retransmit_us, 8_000);
+
+        assert!(publisher.tick(8_000).unwrap());
+        assert_eq!(publisher.retransmit_step, 3);
+        assert_eq!(publisher.next_retransmit_us, 16_000);
+
+        assert!(publisher.tick(16_000).unwrap());
+        assert_eq!(publisher.retransmit_step, 4); // now at len → next tick enters heartbeat
+        assert_eq!(publisher.next_retransmit_us, 32_000);
+
+        // First heartbeat tick
+        assert!(publisher.tick(32_000).unwrap());
+        assert_eq!(publisher.next_retransmit_us, 32_000 + HEARTBEAT_MS * 1_000);
     }
 
     #[test]

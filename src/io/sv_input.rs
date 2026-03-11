@@ -9,11 +9,29 @@ use iec_61850_lib::types::EthernetHeader;
 #[cfg(target_os = "linux")]
 use super::network_utils::{get_interface_index, bind_to_interface, MAX_ETHERNET_FRAME_SIZE, MIN_ETHERNET_FRAME_SIZE};
 
-/// Sample data structure representing one sample from SV stream
+/// Sample data structure representing one sample from SV stream (single-phase).
 #[derive(Debug, Clone)]
 pub struct SampleData {
     /// Raw ADC value for current
     pub current_adc: i32,
+    /// Sample number within the cycle
+    pub sample_number: u16,
+    /// Timestamp in microseconds
+    pub timestamp: u64,
+}
+
+/// Three-phase sample — one ADC reading per phase from an IEC 61850-9-2 SV stream.
+///
+/// Feed each `current_adc_*` through `adc_to_primary()` before passing to
+/// [`ThreePhasePtoc`] or [`ThreePhasePioc`].
+#[derive(Debug, Clone)]
+pub struct ThreePhaseSampleData {
+    /// Raw ADC value — phase A
+    pub current_adc_a: i32,
+    /// Raw ADC value — phase B
+    pub current_adc_b: i32,
+    /// Raw ADC value — phase C
+    pub current_adc_c: i32,
     /// Sample number within the cycle
     pub sample_number: u16,
     /// Timestamp in microseconds

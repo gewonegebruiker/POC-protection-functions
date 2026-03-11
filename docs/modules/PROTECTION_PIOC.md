@@ -41,15 +41,29 @@ Once in `Trip`, the function stays tripped until explicitly reset via `reset()`.
 
 ---
 
+## Input Modes
+
+Two input modes are selected via `PiocInputMode` in `PiocConfig`:
+
+### `Instantaneous` (default)
+The caller passes the raw sample value. PIOC compares `|current|` against `iset`.
+`iset` must be set as a **peak** threshold (≥ `iset_rms × √2`).
+
+### `ShortWindowRms(n)`
+PIOC maintains an internal n-sample sliding-window RMS ring buffer.
+`iset` is then an **RMS** threshold, reducing noise sensitivity at the cost of n sample periods of additional detection latency (n × 250 µs at 4 kSa/s).
+
+```json
+"pioc": { "iset": 700.0, "enabled": true, "input_mode": { "ShortWindowRms": 8 } }
+```
+
 ## Inputs / Outputs
 
 | Direction | Type | Description |
 |-----------|------|-------------|
-| Input | `f64` (primary Amperes) | **Instantaneous** sample value (not RMS) — see note below |
-| Input | `u64` (timestamp, microseconds) | Unused by PIOC; present for `ProtectionFunction` trait compatibility |
+| Input | `f64` (primary Amperes) | Instantaneous sample or ring-buffer output depending on mode |
+| Input | `u64` (timestamp, microseconds) | Unused; present for `ProtectionFunction` trait compatibility |
 | Output | `ProtectionResult` | `NoTrip`, `Trip`, or `Disabled` |
-
-> **Note on RMS vs. instantaneous**: For instantaneous overcurrent detection, using the raw instantaneous sample (peak value) rather than the RMS is valid when `iset` is set as a peak threshold. Alternatively, a very short sliding-window RMS (e.g., 4–8 samples) can be used to reduce noise sensitivity. The current implementation accepts whichever `f64` the caller provides — the caller decides whether to feed an instantaneous sample or a short-window RMS.
 
 ---
 
@@ -70,18 +84,20 @@ For PIOC to meet P1 (≤ 3 ms end-to-end), the processing path from SV receive t
 ```json
 "pioc": {
   "iset": 1200.0,
-  "enabled": true
+  "enabled": true,
+  "input_mode": "Instantaneous"
 }
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `iset` | `f64` | Instantaneous pickup current in primary Amperes |
-| `enabled` | `bool` | Enable or disable the function |
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `iset` | `f64` | — | Peak A for `Instantaneous`; RMS A for `ShortWindowRms` |
+| `enabled` | `bool` | — | Enable or disable |
+| `input_mode` | string/object | `"Instantaneous"` | `"Instantaneous"` or `{"ShortWindowRms": n}` |
 
 Typical settings:
-- `iset` = 5–10× rated primary current (faults close to the busbar produce the highest currents)
-- `iset` should be above the maximum expected load current peak (√2 × load RMS)
+- `iset` = 5–10× rated primary current (busbar faults produce the highest peak)
+- For `Instantaneous` mode: `iset` should exceed the maximum load current peak (`load_rms × √2`)
 
 In Phase 2, `iset` will be read from the SCD file's `PIOC` logical node `StrVal` data attribute.
 
@@ -101,15 +117,23 @@ Located in `src/protection/pioc.rs`:
 | `test_reset` | `reset()` returns state to `Idle` |
 | `test_exact_pickup_no_trip` | Strictly greater-than: `current == iset` → `NoTrip` |
 | `test_set_enabled` | Disabling an active function resets state |
+| `test_short_window_rms_no_trip_below_pickup` | 50 A DC < 100 A RMS threshold → `NoTrip` |
+| `test_short_window_rms_trips_above_pickup` | 150 A DC > 100 A RMS threshold → `Trip` |
+| `test_short_window_rms_reset_clears_buffer` | `reset()` clears ring buffer; subsequent low current → `NoTrip` |
 
 ---
 
+## Implemented
+
+- [x] Instantaneous mode (`|sample| > iset` as peak threshold)
+- [x] Short-window RMS mode (internal n-sample ring buffer, RMS threshold)
+- [x] `reset()` clears ring buffer state
+
 ## TODO
 
-- [ ] **Dedicated core enforcement** — add a runtime assertion or documentation that PIOC is only deployed on a dedicated isolated CPU core. Sharing a core with any other workload risks missing the P1 budget.
-- [ ] **Peak vs. RMS input** — consider a flag in `PiocConfig` to select whether the caller should feed instantaneous peak or short-window RMS, to make the intent explicit.
-- [ ] **Three-phase** — three independent `Pioc` instances for phases A, B, C.
-- [ ] **SCD-driven settings** — read `iset` from SCL `PIOC` logical node.
+- [x] **Three-phase** — `ThreePhasePioc` in `src/protection/three_phase.rs`
+- [ ] **Dedicated core enforcement** — runtime assertion / documentation that PIOC is on an isolated CPU core
+- [ ] **SCD-driven settings** — read `iset` from SCL `PIOC` logical node
 
 ---
 

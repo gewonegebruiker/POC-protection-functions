@@ -7,16 +7,22 @@
 ### Milestones
 
 - [x] PTOC protection logic with definite-time characteristic (`src/protection/ptoc.rs`)
+- [x] PTOC inverse-time curves — IEC Standard / Very / Extremely Inverse (`src/protection/ptoc.rs`)
+- [x] PTOC dropout hysteresis (`dropout_ratio` in `PtocConfig`)
 - [x] PIOC instantaneous protection (`src/protection/pioc.rs`)
+- [x] PIOC short-window RMS input mode (`PiocInputMode::ShortWindowRms`)
 - [x] RMS calculation — cycle-window (`src/measurement/rms.rs`)
 - [x] Sliding-window PTOC (`src/protection/ptoc_sliding.rs`)
 - [x] ADC / CT scaling chain (`src/measurement/scaling.rs`)
 - [x] SV subscriber — raw Ethernet socket, 9-2LE decode (`src/io/sv_input.rs`)
 - [x] GOOSE publisher — raw Ethernet socket, IEC 61850-8-1 encode (`src/io/goose_output.rs`)
-- [x] JSON-driven configuration (`src/config.rs`, `config/bay1.json`)
+- [x] GOOSE retransmission scheduler — 2/4/8/16 ms + 1 s heartbeat (`GoosePublisher::tick`)
+- [x] Live I/O wiring — `IED_LIVE=1` enables real SV → protection → GOOSE loop (`src/main.rs`)
+- [x] JSON-driven configuration (`src/config.rs`, `config/bay1.json`, `config/bay2.json`)
 - [x] Latency tracker with p99 statistics (`src/diagnostics/latency.rs`)
 - [x] Container image + docker-compose deployment (`Dockerfile`, `deploy/docker-compose.yml`)
 - [x] SEAPATH host setup script (`deploy/setup-seapath-host.sh`)
+- [x] Three-phase PTOC/PIOC — `ThreePhasePtoc` / `ThreePhasePioc` trip on any of phases A, B, C
 - [ ] End-to-end HIL test with Omicron CMC — verify PTOC trip time ≤ P3
 - [ ] End-to-end HIL test — verify PIOC trip time ≤ P1 (3 ms)
 - [ ] Confirm PTP synchronisation < 1 µs using hardware timestamping

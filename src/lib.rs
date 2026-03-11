@@ -20,12 +20,16 @@ pub use measurement::{
     adc_to_primary, adc_to_secondary, secondary_to_primary, CurrentScaler,
 };
 
+pub use config::{PiocInputMode, PtocCurve};
+
 pub use protection::{
-    ProtectionFunction, ProtectionResult, TripState, Ptoc, PtocSlidingWindow, Pioc,
+    ProtectionFunction, ProtectionResult, TripState,
+    Ptoc, PtocSlidingWindow, Pioc,
+    Phase, ThreePhaseResult, ThreePhasePtoc, ThreePhasePioc,
 };
 
 pub use io::{
-    SampleData, SvSubscriber, SvSampleBuffer,
+    SampleData, ThreePhaseSampleData, SvSubscriber, SvSampleBuffer,
     GooseTripMessage, GoosePublisher,
 };
 

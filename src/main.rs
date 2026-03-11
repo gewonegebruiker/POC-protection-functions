@@ -5,7 +5,7 @@
 
 use poc_protection_functions::{
     SystemConfig, PtocSlidingWindow, Pioc, ProtectionFunction, ProtectionResult,
-    CurrentScaler, SvSampleBuffer,
+    SvSampleBuffer, SvSubscriber, GoosePublisher, adc_to_primary,
     diagnostics::LatencyTracker,
 };
 use std::error::Error;
@@ -93,7 +93,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     setup_realtime();
 
     // --- Initialise components ---
-    let _scaler = CurrentScaler::new(config.adc.clone(), config.ct.clone());
     let mut sliding_ptoc = PtocSlidingWindow::new(
         config.ptoc.clone(),
         config.sv.samples_per_cycle,
@@ -106,7 +105,72 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut sample_count = 0u64;
     let log_interval = config.sv.samples_per_cycle * 50; // log every ~50 cycles
 
-    log::info!("Entering main loop (simulation mode — no live SV input)");
+    let live_mode = std::env::var("IED_LIVE").map(|v| v == "1").unwrap_or(false);
+
+    if live_mode {
+        // ---------------------------------------------------------------
+        // Live I/O mode: SV network input → protection → GOOSE output
+        // Requires CAP_NET_RAW (Linux) or root.  Set IED_LIVE=1 to enable.
+        // ---------------------------------------------------------------
+        log::info!("Entering live I/O mode (SV input → GOOSE output)");
+        let mut sv = SvSubscriber::new(config.sv.clone());
+        sv.init()?;
+        let mut goose = GoosePublisher::new(config.goose.clone());
+        goose.init()?;
+
+        loop {
+            let now = get_timestamp_micros();
+
+            // Send GOOSE retransmission / heartbeat if one is due
+            goose.tick(now)?;
+
+            // Non-blocking: skip if no SV packet is available yet
+            match sv.receive_sample() {
+                Ok(sample) => {
+                    let primary = adc_to_primary(sample.current_adc, &config.adc, &config.ct);
+                    let t = sample.timestamp;
+                    let start = LatencyTracker::start();
+
+                    let ptoc_result = sliding_ptoc.process_sample(primary, t);
+                    let pioc_result = pioc.process(primary, t);
+
+                    latency.stop(start);
+
+                    let trip = pioc_result == ProtectionResult::Trip
+                        || ptoc_result == ProtectionResult::Trip;
+
+                    if trip != goose.last_trip_state() {
+                        goose.publish_trip(trip, t)?;
+                        if trip {
+                            log::warn!("TRIP! primary={:.1}A t={}µs", primary, t);
+                        } else {
+                            log::info!("CLEAR t={}µs", t);
+                        }
+                    }
+
+                    sample_count += 1;
+                    if sample_count % log_interval as u64 == 0 {
+                        if let Some(stats) = latency.stats() {
+                            log::info!("sample={} {}", sample_count, stats);
+                        }
+                    }
+                }
+                // Non-blocking socket returned WouldBlock — spin
+                Err(e) if e.to_string().contains("No data available") => {}
+                Err(e) => {
+                    log::error!("SV receive error: {}", e);
+                    break;
+                }
+            }
+        }
+
+        return Ok(());
+    }
+
+    // ---------------------------------------------------------------
+    // Simulation mode (default — no network hardware required)
+    // ---------------------------------------------------------------
+    log::info!("Entering simulation mode (set IED_LIVE=1 for live SV input)");
 
     // --- Simulation loop (replaces live SV subscriber for portability) ---
     let base_time = get_timestamp_micros();

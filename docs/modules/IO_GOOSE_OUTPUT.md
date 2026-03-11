@@ -87,24 +87,51 @@ In the future, these values will be read from the SCD file's `GSE` address secti
 
 ---
 
+## Retransmission Scheduler
+
+IEC 61850-8-1 requires accelerated retransmissions after a state change so that subscribers recover quickly from a missed frame.
+
+### Schedule (times from the state-change frame)
+
+| Step | Cumulative offset | Next interval |
+|------|-------------------|---------------|
+| State change | 0 ms (immediate) | — |
+| Retransmit 1 | +2 ms | 2 ms |
+| Retransmit 2 | +6 ms | 4 ms |
+| Retransmit 3 | +14 ms | 8 ms |
+| Retransmit 4 | +30 ms | 16 ms |
+| Heartbeat | every 1 000 ms | 1 000 ms |
+
+Call `GoosePublisher::tick(now_us)` on every sample iteration:
+
+```rust
+loop {
+    let now = get_timestamp_micros();
+    goose.tick(now)?;                      // sends retransmit/heartbeat if due
+    if trip != goose.last_trip_state() {
+        goose.publish_trip(trip, now)?;    // state change — resets schedule
+    }
+}
+```
+
 ## Implemented
 
 - [x] Raw AF_PACKET socket creation and binding (Linux only)
 - [x] Source MAC address detection from the network interface
 - [x] GOOSE PDU encoding via `iec_61850_lib::encode_goose::encode_goose`
 - [x] `stNum` increment on state change, `sqNum` increment on retransmission
+- [x] IEC 61850-8-1 retransmission schedule (2/4/8/16 ms) + 1 s heartbeat via `tick()`
 - [x] MAC address string parsing
-- [x] Fallback simulation mode on non-Linux targets
+- [x] Non-Linux build fix — `#[cfg]` conditional for `DEFAULT_SRC_MAC`
 
 ---
 
 ## TODO
 
-- [ ] **Retransmission profile** — IEC 61850-8-1 requires GOOSE to be retransmitted after a state change using an accelerated schedule (e.g., T1 = 2 ms, T2 = 4 ms, T3 = 8 ms … up to a steady-state interval T_max). Currently only a single frame is sent per call; the RT loop must call `publish_trip()` repeatedly to retransmit.
-- [ ] **VLAN tagging (802.1Q)** — process-bus switches may require VLAN-tagged frames. Add optional VLAN ID and priority fields to `GooseConfig`.
-- [ ] **`timeAllowedToLive` calculation** — should be derived from the retransmission profile (2 × T_max).
-- [ ] **Dataset size / additional entries** — the current implementation sends a single `BOOLEAN` trip value. Future support for multi-entry datasets (e.g., trip + quality + timestamp).
-- [ ] **GOOSE receiver** — for RBRF (breaker failure) and interlocking, the container needs to subscribe to GOOSE messages from other IEDs.
+- [ ] **VLAN tagging (802.1Q)** — add optional VLAN ID and priority to `GooseConfig`
+- [ ] **`timeAllowedToLive`** — derive from retransmission profile (2 × T_max = 2 032 ms)
+- [ ] **Multi-entry datasets** — trip + quality + timestamp
+- [ ] **GOOSE receiver** — subscribe to XCBR/interlocking GOOSE from other IEDs
 
 ---
 
